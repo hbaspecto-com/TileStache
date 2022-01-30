@@ -152,7 +152,6 @@ If you are using PostGIS and spherical mercator a.k.a. SRID 900913,
 you can save yourself a world of trouble by using this definition:
   http://github.com/straup/postgis-tools/raw/master/spatial_ref_900913-8.3.sql
 """
-
 from re import compile
 from urlparse import urlparse, urljoin
 
@@ -166,6 +165,10 @@ from osgeo import ogr, osr
 from TileStache.Core import KnownUnknown
 from TileStache.Geography import getProjectionByName
 from Arc import reserialize_to_arc, pyamf_classes
+# ABL logging to test driver opening
+import logging
+from time import time
+logger = logging.getLogger(__name__)
 
 class VectorResponse:
     """ Wrapper class for Vector response that makes it behave like a PIL.Image object.
@@ -303,7 +306,7 @@ def _tile_perimeter_geom(coord, projection, padded):
         Uses _tile_perimeter().
     """
     perimeter = _tile_perimeter(coord, projection, padded)
-    wkt = 'POLYGON((%s))' % ', '.join(['%.7f %.7f' % xy for xy in perimeter])
+    wkt = 'POLYGON((%s))' % ', '.join(['%.3f %.3f' % xy for xy in perimeter])
     geom = ogr.CreateGeometryFromWkt(wkt)
     
     ref = osr.SpatialReference()
@@ -312,7 +315,7 @@ def _tile_perimeter_geom(coord, projection, padded):
     
     return geom
 
-def _feature_properties(feature, layer_definition, whitelist=None, skip_empty_fields=False):
+def _feature_properties(feature, layer_definition, whitelist=None):
     """ Returns a dictionary of feature properties for a feature in a layer.
     
         Third argument is an optional list or dictionary of properties to
@@ -343,11 +346,10 @@ def _feature_properties(feature, layer_definition, whitelist=None, skip_empty_fi
                 raise KnownUnknown("Found an OGR field type I've never even seen: %d" % field_type)
             else:
                 raise KnownUnknown("Found an OGR field type I don't know what to do with: ogr.%s" % name)
-
-        if not skip_empty_fields or feature.IsFieldSet(name):
-            property = type(whitelist) is dict and whitelist[name] or name
-            properties[property] = feature.GetField(name)
-
+       
+        property = type(whitelist) is dict and whitelist[name] or name
+        properties[property] = feature.GetField(name)
+    
     return properties
 
 def _append_with_delim(s, delim, data, key):
@@ -356,10 +358,11 @@ def _append_with_delim(s, delim, data, key):
     else:
         return s
 	
-def _open_layer(driver_name, parameters, dirpath):
+def _open_layer(driver_name, parameters, dirpath, the_layer):
     """ Open a layer, return it and its datasource.
     
         Dirpath comes from configuration, and is used to locate files.
+        ABL hack add the_layer refence to Layer instance
     """
     #
     # Set up the driver
@@ -420,7 +423,7 @@ def _open_layer(driver_name, parameters, dirpath):
         
     elif driver_name in ('ESRI Shapefile', 'GeoJSON', 'SQLite'):
         if 'file' not in parameters:
-            raise KnownUnknown('Need a "file" parameter')
+            raise KnownUnknown('Need at least a "file" parameter for a shapefile')
     
         file_href = urljoin(dirpath, parameters['file'])
         scheme, h, file_path, q, p, f = urlparse(file_href)
@@ -430,7 +433,9 @@ def _open_layer(driver_name, parameters, dirpath):
         
         source_name = file_path
 
+    start_time = time()
     datasource = driver.Open(str(source_name))
+    logger.info('TileStache.Vector.__init__._open_layer() in %.3f', time() - start_time)
 
     if datasource is None:
         raise KnownUnknown('Couldn\'t open datasource %s' % source_name)
@@ -440,7 +445,16 @@ def _open_layer(driver_name, parameters, dirpath):
     #
     if driver_name == 'PostgreSQL' or driver_name == 'OCI' or driver_name == 'MySQL':
         if 'query' in parameters:
-            layer = datasource.ExecuteSQL(str(parameters['query']))
+            # New approach: pass in selection_id directly
+            if 'selection_id' in the_layer._query:
+                # We'll support user_id because of legacy instances
+                # that have {user_id} in the query string.
+                parameters['selection_id'] = parameters['user_id'] = the_layer._query['selection_id']
+            elif parameters.get('user_id_lookup'):
+            # ABL hack resolve user_id from user_id_lookup and the_layer._query.user_id
+                parameters['user_id'] = parameters['user_id_lookup'][the_layer._query['user_id'][0]]
+            # ABL hack add .format(parametrs)
+            layer = datasource.ExecuteSQL(str(parameters['query'].format(**parameters)))
         elif 'table' in parameters:
             layer = datasource.GetLayerByName(str(parameters['table']))
         else:
@@ -461,7 +475,7 @@ def _open_layer(driver_name, parameters, dirpath):
     #
     return layer, datasource
 
-def _get_features(coord, properties, projection, layer, clipped, projected, spacing, id_property, skip_empty_fields=False):
+def _get_features(coord, properties, projection, layer, clipped, projected, spacing, id_property):
     """ Return a list of features in an OGR layer with properties in GeoJSON form.
     
         Optionally clip features to coordinate bounding box, and optionally
@@ -525,7 +539,7 @@ def _get_features(coord, properties, projection, layer, clipped, projected, spac
         geometry.TransformTo(output_sref)
 
         geom = json_loads(geometry.ExportToJson())
-        prop = _feature_properties(feature, definition, properties, skip_empty_fields)
+        prop = _feature_properties(feature, definition, properties)
 
         geojson_feature = {'type': 'Feature', 'properties': prop, 'geometry': geom}
         if id_property != None and id_property in prop:
@@ -540,7 +554,7 @@ class Provider:
         See module documentation for explanation of constructor arguments.
     """
     
-    def __init__(self, layer, driver, parameters, clipped, verbose, projected, spacing, properties, precision, id_property, skip_empty_fields=False):
+    def __init__(self, layer, driver, parameters, clipped, verbose, projected, spacing, properties, precision, id_property):
         self.layer      = layer
         self.driver     = driver
         self.clipped    = clipped
@@ -551,7 +565,6 @@ class Provider:
         self.properties = properties
         self.precision  = precision
         self.id_property = id_property
-        self.skip_empty_fields = skip_empty_fields
 
     @staticmethod
     def prepareKeywordArgs(config_dict):
@@ -566,7 +579,6 @@ class Provider:
         kwargs['projected'] = bool(config_dict.get('projected', False))
         kwargs['verbose'] = bool(config_dict.get('verbose', False))
         kwargs['precision'] = int(config_dict.get('precision', 6))
-        kwargs['skip_empty_fields'] = bool(config_dict.get('skip_empty_fields', False))
         
         if 'spacing' in config_dict:
             kwargs['spacing'] = float(config_dict.get('spacing', 0.0))
@@ -583,8 +595,9 @@ class Provider:
     def renderTile(self, width, height, srs, coord):
         """ Render a single tile, return a VectorResponse instance.
         """
-        layer, ds = _open_layer(self.driver, self.parameters, self.layer.config.dirpath)
-        features = _get_features(coord, self.properties, self.layer.projection, layer, self.clipped, self.projected, self.spacing, self.id_property, self.skip_empty_fields)
+        # ABL hack add forth argument self.layer
+        layer, ds = _open_layer(self.driver, self.parameters, self.layer.config.dirpath, self.layer)
+        features = _get_features(coord, self.properties, self.layer.projection, layer, self.clipped, self.projected, self.spacing, self.id_property)
         response = {'type': 'FeatureCollection', 'features': features}
         
         if self.projected:

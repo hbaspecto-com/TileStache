@@ -4,7 +4,6 @@ dist
 build
 TileStache-*.*
 TileStache-*.*.tar.gz
-TileStache.egg-info/
 *.dbf
 *.prj
 *.sbn

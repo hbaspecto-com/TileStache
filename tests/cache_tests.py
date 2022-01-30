@@ -66,3 +66,8 @@ class CacheTests(TestCase):
 
         self.assertEqual(self.mc.get('/1/memcache_osm/0/0/0.PNG'), None,
             'Memcache returned a value even though it should have been empty')
+
+
+
+
+
